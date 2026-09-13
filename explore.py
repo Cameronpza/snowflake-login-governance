@@ -41,23 +41,25 @@ def main():
         conn_kwargs["warehouse"] = WAREHOUSE
 
     conn = snowflake.connector.connect(**conn_kwargs)
-    cur = conn.cursor()
-
-    run(cur, "SELECT CURRENT_ACCOUNT(), CURRENT_USER(), CURRENT_ROLE(), CURRENT_WAREHOUSE()", "Session info")
-    run(
-        cur,
-        """
-        SELECT EVENT_TIMESTAMP, USER_NAME, CLIENT_IP, REPORTED_CLIENT_TYPE,
-               FIRST_AUTHENTICATION_FACTOR, IS_SUCCESS, ERROR_MESSAGE
-        FROM SNOWFLAKE.ACCOUNT_USAGE.LOGIN_HISTORY
-        ORDER BY EVENT_TIMESTAMP DESC
-        LIMIT 25
-        """,
-        "Recent login history (ACCOUNT_USAGE)",
-    )
-
-    cur.close()
-    conn.close()
+    try:
+        cur = conn.cursor()
+        try:
+            run(cur, "SELECT CURRENT_ACCOUNT(), CURRENT_USER(), CURRENT_ROLE(), CURRENT_WAREHOUSE()", "Session info")
+            run(
+                cur,
+                """
+                SELECT EVENT_TIMESTAMP, USER_NAME, CLIENT_IP, REPORTED_CLIENT_TYPE,
+                       FIRST_AUTHENTICATION_FACTOR, IS_SUCCESS, ERROR_MESSAGE
+                FROM SNOWFLAKE.ACCOUNT_USAGE.LOGIN_HISTORY
+                ORDER BY EVENT_TIMESTAMP DESC
+                LIMIT 25
+                """,
+                "Recent login history (ACCOUNT_USAGE)",
+            )
+        finally:
+            cur.close()
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
