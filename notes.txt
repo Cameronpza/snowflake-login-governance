@@ -1,0 +1,60 @@
+2026-09-17 - LOGIN_HISTORY exploration (LOGIN_GOVERNANCE_READER role)
+
+Ran SQL/01-05 against SNOWFLAKE.ACCOUNT_USAGE.LOGIN_HISTORY. Summary:
+
+- Volume: 39 rows total. Date range 2026-09-10 to 2026-09-17, but really only
+  4 distinct calendar days with activity (Sep 10, 12, 13, 17).
+- Users: CAMZA (14, real human), TESTUSER1 (12), TESTUSER2 (7),
+  CLAUDE_SERVICE_USER (6, this exploration + prior script runs).
+- Success/fail: 26 success / 13 fail.
+- Auth factors: FIRST_AUTHENTICATION_FACTOR is PASSWORD (31) or
+  PROGRAMMATIC_ACCESS_TOKEN (6, all CAMZA via SQL_API), null on 2 failed
+  attempts. SECOND_AUTHENTICATION_FACTOR is null on EVERY row - no MFA use
+  at all in this dataset. LOGIN_DETAILS is always "{}", CONNECTION and
+  AUTHORIZING_INTEGRATION_NAME always null - no extra signal hiding there.
+- Failure reasons: INCORRECT_USERNAME_PASSWORD (8), OVERFLOW_FAILURE_EVENTS_ELIDED
+  (2 - Snowflake's own "there were more failures than we recorded" marker),
+  PASSWORD_EXPIRED (1), USER_LOCKED_TEMP (1),
+  INCOMING_REQUEST_BLOCKED_NETWORK_POLICY_REQUIRED (1).
+- Failure clustering: real bursts exist - TESTUSER1 had 6 failed attempts on
+  2026-09-12, TESTUSER2 had 4 on the same day (one burst led to
+  USER_LOCKED_TEMP + an OVERFLOW_FAILURE_EVENTS_ELIDED row, meaning the true
+  burst was larger than what's recorded).
+- Time of day (UTC hour): 8(1), 12(7), 13(19), 14(9), 15(3) - everything
+  clustered in an ~8-hour band.
+- Day of week: Sat(24), Sun(11), Thu(4) - weekend-heavy, consistent with
+  this being manually-generated test activity rather than real usage.
+- IPs: 102.132.245.66 accounts for 37/39 rows across all 4 users. The other
+  2 rows are 0.0.0.0, which is a placeholder tied to the
+  OVERFLOW_FAILURE_EVENTS_ELIDED rows, not a genuine second source. Every
+  user is effectively logging in from one IP.
+
+Implication for the PRD: repeated-failed-logins is well supported by real
+data. Weak-auth/MFA and odd-hour-logins are not well supported yet - see
+PRD.md "Data limitations" for the flags on each.
+
+2026-09-20 - Dashboard build (SQL/06-08 + app.py)
+
+Data volume roughly doubled since the PRD was drafted: 99 rows total (was
+39), same 4 users, date range now 2026-09-10 to 2026-09-19. Failure/auth-
+factor/hour-of-day shape is consistent with the original exploration (still
+0% MFA, still one real source IP, CAMZA still the only PAT user) - more
+volume, not a different pattern, so the PRD's detection decisions still
+hold.
+
+Built the three MVP queries (SQL/06_repeated_failed_logins.sql,
+SQL/07_mfa_compliance.sql, SQL/08_odd_hours.sql) and a Streamlit dashboard
+(app.py) that runs them via LOGIN_GOVERNANCE_READER and renders each as
+header + count + table, per the PRD MVP scope. Config values flagged as
+open questions in the PRD (excluded-accounts list, odd-hours timezone,
+failure threshold/window) are exposed as sidebar controls with the PRD's
+baseline defaults (N=5/T=10, 08:00-18:00 UTC, test/service accounts
+excluded by default) rather than hardcoded, since the PRD left them as
+tunable, not blocking.
+
+One correction from the original exploration: HOUR(EVENT_TIMESTAMP) without
+an explicit CONVERT_TIMEZONE reflects the Snowflake session's default
+timezone, not UTC - the notes.txt "hour of day (UTC)" breakdown above was
+actually LA-local hours. SQL/08 converts explicitly via
+CONVERT_TIMEZONE(:timezone, EVENT_TIMESTAMP) so the odd-hours window isn't
+silently tied to whichever session runs the query.
