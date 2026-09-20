@@ -1,60 +1,63 @@
-2026-09-17 - LOGIN_HISTORY exploration (LOGIN_GOVERNANCE_READER role)
-
-Ran SQL/01-05 against SNOWFLAKE.ACCOUNT_USAGE.LOGIN_HISTORY. Summary:
-
-- Volume: 39 rows total. Date range 2026-09-10 to 2026-09-17, but really only
-  4 distinct calendar days with activity (Sep 10, 12, 13, 17).
-- Users: CAMZA (14, real human), TESTUSER1 (12), TESTUSER2 (7),
-  CLAUDE_SERVICE_USER (6, this exploration + prior script runs).
-- Success/fail: 26 success / 13 fail.
-- Auth factors: FIRST_AUTHENTICATION_FACTOR is PASSWORD (31) or
-  PROGRAMMATIC_ACCESS_TOKEN (6, all CAMZA via SQL_API), null on 2 failed
-  attempts. SECOND_AUTHENTICATION_FACTOR is null on EVERY row - no MFA use
-  at all in this dataset. LOGIN_DETAILS is always "{}", CONNECTION and
-  AUTHORIZING_INTEGRATION_NAME always null - no extra signal hiding there.
-- Failure reasons: INCORRECT_USERNAME_PASSWORD (8), OVERFLOW_FAILURE_EVENTS_ELIDED
-  (2 - Snowflake's own "there were more failures than we recorded" marker),
-  PASSWORD_EXPIRED (1), USER_LOCKED_TEMP (1),
-  INCOMING_REQUEST_BLOCKED_NETWORK_POLICY_REQUIRED (1).
-- Failure clustering: real bursts exist - TESTUSER1 had 6 failed attempts on
-  2026-09-12, TESTUSER2 had 4 on the same day (one burst led to
-  USER_LOCKED_TEMP + an OVERFLOW_FAILURE_EVENTS_ELIDED row, meaning the true
-  burst was larger than what's recorded).
-- Time of day (UTC hour): 8(1), 12(7), 13(19), 14(9), 15(3) - everything
-  clustered in an ~8-hour band.
-- Day of week: Sat(24), Sun(11), Thu(4) - weekend-heavy, consistent with
-  this being manually-generated test activity rather than real usage.
-- IPs: 102.132.245.66 accounts for 37/39 rows across all 4 users. The other
-  2 rows are 0.0.0.0, which is a placeholder tied to the
-  OVERFLOW_FAILURE_EVENTS_ELIDED rows, not a genuine second source. Every
-  user is effectively logging in from one IP.
-
-Implication for the PRD: repeated-failed-logins is well supported by real
-data. Weak-auth/MFA and odd-hour-logins are not well supported yet - see
-PRD.md "Data limitations" for the flags on each.
-
-2026-09-20 - Dashboard build (SQL/06-08 + app.py)
-
-Data volume roughly doubled since the PRD was drafted: 99 rows total (was
-39), same 4 users, date range now 2026-09-10 to 2026-09-19. Failure/auth-
-factor/hour-of-day shape is consistent with the original exploration (still
-0% MFA, still one real source IP, CAMZA still the only PAT user) - more
-volume, not a different pattern, so the PRD's detection decisions still
-hold.
-
-Built the three MVP queries (SQL/06_repeated_failed_logins.sql,
-SQL/07_mfa_compliance.sql, SQL/08_odd_hours.sql) and a Streamlit dashboard
-(app.py) that runs them via LOGIN_GOVERNANCE_READER and renders each as
-header + count + table, per the PRD MVP scope. Config values flagged as
-open questions in the PRD (excluded-accounts list, odd-hours timezone,
-failure threshold/window) are exposed as sidebar controls with the PRD's
-baseline defaults (N=5/T=10, 08:00-18:00 UTC, test/service accounts
-excluded by default) rather than hardcoded, since the PRD left them as
-tunable, not blocking.
-
-One correction from the original exploration: HOUR(EVENT_TIMESTAMP) without
-an explicit CONVERT_TIMEZONE reflects the Snowflake session's default
-timezone, not UTC - the notes.txt "hour of day (UTC)" breakdown above was
-actually LA-local hours. SQL/08 converts explicitly via
-CONVERT_TIMEZONE(:timezone, EVENT_TIMESTAMP) so the odd-hours window isn't
-silently tied to whichever session runs the query.
+Notes — Snowflake Login Governance Project
+A full record of how this project was built, start to finish.
+---
+1. Setup
+Created project folder at `C:\Users\Cameron\work\repos\snowflake-login-governance`, matching GitHub repo created alongside it.
+Signed up for a Snowflake free trial account. Account identifier: `vl30231.af-south-1.aws` (AWS, af-south-1/Cape Town region). $400 trial credit, 30-day trial.
+Created two test users (`testuser1`, `testuser2`) and generated real login activity by logging in/out multiple times, including deliberate wrong-password attempts.
+Accidentally triggered a real Snowflake security feature: 5 failed login attempts locks an account for 15 minutes. Unlocked manually with `ALTER USER testuser2 SET MINS_TO_UNLOCK = 0;`. Good real-world proof-of-concept for the "repeated failed logins" detection this project is built around.
+2. The MCP Journey — Three Attempts, Three Genuine Blockers
+The original goal was to connect Claude Code to Snowflake via MCP (Model Context Protocol), so Claude Code could query real data conversationally while building.
+Attempt 1 — Snowflake's own managed MCP server
+Created successfully via SQL (`CREATE MCP SERVER ... FROM SPECIFICATION`), scoped to read-only SQL execution.
+Generated a Programmatic Access Token (PAT) to connect it.
+Hit a network policy requirement (Snowflake error 390432) — fixed by creating a network policy (`ALLOWED_IP_LIST = ('0.0.0.0/0')`) and applying it account-wide. Noted trade-off: allowing all IPs is acceptable for a personal dev account, would be scoped tighter in production.
+Still failed with "Access denied for trial accounts" (error 399504) — confirmed via research that Snowflake's managed MCP server requires a paid account tier, not available on trial accounts at all. Genuine platform restriction, not fixable.
+Attempt 2 — Open-source alternative (`dynamike/snowflake-mcp-server`)
+Cloned into `C:\Users\Cameron\work\sandbox\snowflake-mcp-server` (kept separate from own project code, per the repos/sandbox folder convention).
+Failed to build: `cffi` package couldn't compile on Python 3.14 (too new — missing Microsoft C++ Build Tools).
+Fixed by pinning the tool's virtual environment to Python 3.12 instead (`uv python install 3.12`, `uv venv --python 3.12`), without touching the main system Python install.
+Attempt 3 — Same tool, now running, external-browser auth
+Connected to Claude Code via `claude mcp add` with a local stdio command.
+Timed out after 30 seconds — external-browser SSO login needs a human to complete it interactively, but Claude Code's MCP connection attempt doesn't wait long enough for that.
+Decision: after diagnosing all three failures individually (not just giving up), dropped MCP for the Snowflake connection specifically. Connected via the Snowflake Python connector directly instead. Removed the broken `snowflake-read` MCP registration from Claude Code (`claude mcp remove`).
+3. Connecting Directly (Python Connector)
+Initial attempts used the personal Snowflake login (`CamZA`), which turned out to be SSO-only (no traditional password) — couldn't be used for direct password-based scripts.
+Created a dedicated service account instead (`claude_service_user`) with proper password authentication — standard practice: keep personal SSO login separate from service/automation credentials.
+Credentials stored in a local `.env` file (gitignored); `.env.example` committed as a template with placeholder values only.
+Several rounds of `.env` not saving correctly through the VS Code editor — eventually fixed by overwriting the file directly via a PowerShell heredoc command for a clean, deterministic write.
+First successful connection confirmed: session info, databases, warehouses, roles, and users all queried successfully via the direct Python connector.
+4. The Security Fix — Least-Privilege Role
+The problem found: `claude_service_user` had been given full `ACCOUNTADMIN` access — far more than needed just to read login history. Flagged as ironic in a project specifically about login governance.
+The fix:
+Created a new role, `LOGIN_GOVERNANCE_READER`, using Snowflake's built-in `SNOWFLAKE.SECURITY_VIEWER` database role — scoped to security-relevant views only (LOGIN_HISTORY, USERS, GRANTS_TO_USERS, etc.), not the entire ACCOUNT_USAGE schema.
+Granted only `USAGE` on the warehouse (enough to run queries, not manage it).
+Granted the new role to `claude_service_user`, set it as the default role, and revoked `ACCOUNTADMIN` entirely.
+Built as an idempotent script (`setup_service_role.py`), safe to re-run.
+Verification (not just assumed):
+Confirmed `CURRENT_ROLE()` showed `LOGIN_GOVERNANCE_READER` after the change.
+Confirmed `LOGIN_HISTORY` queries still worked under the restricted role.
+Deliberately tried `USE ROLE ACCOUNTADMIN` afterward and confirmed it correctly failed — proving the downgrade actually took effect, not just switched at the session level.
+5. Planning the Dashboard (PRD)
+Had Claude Code explore the real data first, before designing any detection logic. Findings from real `LOGIN_HISTORY` data (39 rows initially, later grown to 99):
+Only 4 users active (1 real personal account, 2 test accounts, 1 service account), effectively 1 source IP.
+Repeated failed logins — well supported by real data. Genuine failure bursts existed (from the earlier lockout testing), including Snowflake's own `USER_LOCKED_TEMP` and `OVERFLOW_FAILURE_EVENTS_ELIDED` markers.
+Weak auth / MFA — `SECOND_AUTHENTICATION_FACTOR` was null on every single row (0% MFA usage account-wide). Decision: no baseline exists to detect a deviation from, so this became a standing compliance tile (MFA usage rate) rather than an anomaly detector — more honest than forcing a fake signal.
+Odd-hour logins — only 4 active calendar days, heavily weekend/test-skewed. Decision: use a simple, static business-hours window (08:00–18:00, timezone-configurable) rather than a per-user learned baseline, which the data was too thin to support honestly.
+PRD written to `PRD.md`, decisions recorded, marked "Ready to build" once all three open questions were resolved.
+6. Building
+`SQL/01–05` — exploration queries (schema, users/auth, failures, odd hours, login details/connection info) — used to inform the PRD.
+`SQL/06_repeated_failed_logins.sql` — sliding-window burst detection (N failures in T minutes) plus automatic escalation flags for Snowflake's own lockout/overflow events.
+`SQL/07_mfa_compliance.sql` — overall + per-user MFA compliance rate, plus a separate tile for programmatic access token (PAT) logins.
+`SQL/08_odd_hours.sql` — static business-hours window. Caught and fixed a real bug along the way: unconverted `HOUR()` was silently using session-local time instead of UTC — fixed with explicit `CONVERT_TIMEZONE`.
+`app.py` — Streamlit dashboard, same header/count/table layout as the first project. Sidebar exposes the PRD's open config questions (excluded accounts, timezone/window, failure threshold) as live-tunable controls rather than hardcoded values.
+7. Review and Security
+`/ultrareview` (multi-agent cloud review) run before first push — found and fixed 4 real bugs: leaked real account/username values in `.env.example`, a "bootstrap trap" where a partial failure in the role-setup script could strand the service account with no valid role, a hardcoded warehouse name instead of using the configured one, and missing `try/finally` connection cleanup on failure.
+`/security-review` (full codebase) — no HIGH or MEDIUM confidence findings. Confirmed: all dynamic SQL values use proper parameterized binding (no injection risk), `.env` genuinely untracked by Git, no unsafe HTML rendering, `setup_service_role.py` reduces privilege rather than introducing an escalation path.
+8. Deployment
+Pushed to GitHub: `github.com/Cameronpza/snowflake-login-governance`
+Deployed to Streamlit Community Cloud: `https://security-risk-dashboard2.streamlit.app/`
+Real Snowflake credentials added via Streamlit's "Secrets" settings — never committed to the repo.
+Full `README.md` written covering the real setup, the three MCP attempts and why each failed, the security fix (with verification), and the dashboard itself.
+9. Where This Stands
+Fully complete: real Snowflake account, real login data, a properly verified least-privilege security fix, three working detection flags built on honest data-driven decisions, a live public dashboard, and full documentation of the entire process — including the parts that didn't work and why.
